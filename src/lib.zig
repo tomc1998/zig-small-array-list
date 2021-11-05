@@ -8,7 +8,11 @@ pub fn SmallArrayList(comptime T: type, comptime size: usize) type {
 /// An array list with a small size optimisation. length is shrunk to u32, to
 /// take advantage of this, rather than a usize (since the use case for this
 /// will probably be many arrays which barely stores any elements).
-pub fn AlignedSmallArrayList(comptime T: type, comptime size: usize, comptime alignment: ?u29) type {
+pub fn AlignedSmallArrayList(
+    comptime T: type,
+    comptime size: usize,
+    comptime alignment: ?u29,
+) type {
     const Slice = if (alignment) |a| ([]align(a) T) else []T;
     const SliceConst = if (alignment) |a| ([]align(a) const T) else []const T;
 
@@ -30,23 +34,20 @@ pub fn AlignedSmallArrayList(comptime T: type, comptime size: usize, comptime al
 
         /// Either small storage (local, inline with struct) or big (heap allocated) storage
         items: ArrayListItems,
-        /// TODO why tf am i storing an allocator here, defeats the whole point
-        allocator: *Allocator,
         len: u32,
 
-        pub fn init(allocator: *Allocator) Self {
+        pub fn init() Self {
             return Self{
                 .items = ArrayListItems{ .Small = undefined },
-                .allocator = allocator,
                 .len = 0,
             };
         }
 
-        pub fn deinit(self: *const Self) void {
+        pub fn deinit(self: *const Self, allocator: *Allocator) void {
             if (self.is_small()) {
                 return;
             }
-            self.allocator.free(self.items.Big);
+            allocator.free(self.items.Big);
         }
 
         pub fn at(self: *const Self, i: usize) T {
@@ -98,22 +99,22 @@ pub fn AlignedSmallArrayList(comptime T: type, comptime size: usize, comptime al
             return self.swapRemove(i);
         }
 
-        pub fn appendSlice(self: *Self, items: SliceConst) !void {
-            try self.ensureCapacity(self.len + items.len);
+        pub fn appendSlice(self: *Self, allocator: *Allocator, items: SliceConst) !void {
+            try self.ensureCapacity(allocator, self.len + items.len);
             std.mem.copy(T, self.itemsAsSlice()[self.len..], items);
             self.len += @intCast(u32, items.len);
         }
 
-        pub fn resize(self: *Self, new_len: usize) !void {
-            try self.ensureCapacity(new_len);
+        pub fn resize(self: *Self, allocator: *Allocator, new_len: usize) !void {
+            try self.ensureCapacity(allocator, new_len);
             self.len = new_len;
         }
 
-        pub fn shrink(self: *Self, new_len: usize) void {
+        pub fn shrink(self: *Self, allocator: *Allocator, new_len: usize) void {
             std.debug.assert(new_len <= self.len);
             self.len = new_len;
             var slice = self.itemsAsSlice();
-            slice = self.allocator.realloc(self.itemsAsSlice(), new_len) catch |e| switch (e) {
+            slice = allocator.realloc(self.itemsAsSlice(), new_len) catch |e| switch (e) {
                 error.OutOfMemory => return, // no problem, capacity is still correct then.
             };
         }
@@ -121,40 +122,38 @@ pub fn AlignedSmallArrayList(comptime T: type, comptime size: usize, comptime al
         /// ArrayList takes ownership of the passed in slice. The slice must have been
         /// allocated with `allocator`.
         /// Deinitialize with `deinit` or use `toOwnedSlice`.
-        pub fn fromOwnedSlice(allocator: *Allocator, slice: Slice) Self {
+        pub fn fromOwnedSlice(slice: Slice) Self {
             return Self{
                 .items = ArrayListItems{ .Big = slice },
                 .len = slice.len,
-                .allocator = allocator,
             };
         }
 
         /// The caller owns the returned std.memory. ArrayList becomes empty.
-        pub fn toOwnedSlice(self: *Self) Slice {
-            const allocator = self.allocator;
-            const result = allocator.shrink(self.itemsAsSlice(), self.len);
-            self.* = init(allocator);
+        pub fn toOwnedSlice(self: *Self, allocator: *Allocator) Slice {
+            const result = allocator.shrink(allocator, self.itemsAsSlice(), self.len);
+            self.* = init();
             return result;
         }
 
-        pub fn insert(self: *Self, n: usize, item: T) !void {
-            try self.ensureCapacity(self.len + 1);
+        pub fn insert(self: *Self, allocator: *Allocator, n: usize, item: T) !void {
+            try self.ensureCapacity(allocator, self.len + 1);
             self.len += 1;
 
             std.mem.copyBackwards(T, self.itemsAsSlice()[n + 1 .. self.len], self.itemsAsSlice()[n .. self.len - 1]);
             self.itemsAsSlice()[n] = item;
         }
 
-        pub fn insertSlice(self: *Self, n: usize, items: SliceConst) !void {
-            try self.ensureCapacity(self.len + items.len);
+        pub fn insertSlice(self: *Self, allocator: *Allocator, n: usize, items: SliceConst) !void {
+            try self.ensureCapacity(allocator, self.len + items.len);
             self.len += @intCast(u32, items.len);
 
             std.mem.copyBackwards(T, self.itemsAsSlice()[n + items.len .. self.len], self.itemsAsSlice()[n .. self.len - items.len]);
             std.mem.copy(T, self.itemsAsSlice()[n .. n + items.len], items);
         }
 
-        pub fn append(self: *Self, item: T) !void {
-            const new_item_ptr = try self.addOne();
+        pub fn append(self: *Self, allocator: *Allocator, item: T) !void {
+            const new_item_ptr = try self.addOne(allocator);
             new_item_ptr.* = item;
         }
 
@@ -196,7 +195,7 @@ pub fn AlignedSmallArrayList(comptime T: type, comptime size: usize, comptime al
             };
         }
 
-        pub fn ensureCapacity(self: *Self, new_capacity: usize) !void {
+        pub fn ensureCapacity(self: *Self, allocator: *Allocator, new_capacity: usize) !void {
             var better_capacity = self.capacity();
             if (better_capacity >= new_capacity) return;
             while (true) {
@@ -204,18 +203,18 @@ pub fn AlignedSmallArrayList(comptime T: type, comptime size: usize, comptime al
                 if (better_capacity >= new_capacity) break;
             }
             self.items = switch (self.items) {
-                ArrayListItems.Big => |big| ArrayListItems{ .Big = try self.allocator.realloc(big, better_capacity) },
+                ArrayListItems.Big => |big| ArrayListItems{ .Big = try allocator.realloc(big, better_capacity) },
                 ArrayListItems.Small => |_| v: {
-                    var newMem = try self.allocator.alloc(T, better_capacity);
+                    var newMem = try allocator.alloc(T, better_capacity);
                     std.mem.copy(T, newMem, self.itemsAsSlice());
                     break :v ArrayListItems{ .Big = newMem };
                 },
             };
         }
 
-        pub fn addOne(self: *Self) !*T {
+        pub fn addOne(self: *Self, allocator: *Allocator) !*T {
             const new_length = self.len + 1;
-            try self.ensureCapacity(new_length);
+            try self.ensureCapacity(allocator, new_length);
             return self.addOneAssumeCapacity();
         }
 
